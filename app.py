@@ -1,21 +1,30 @@
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_marshmallow import Marshmallow
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import date
 
 # 1. Initialize the app
 app = Flask(__name__)
 
-# 2. Database Configuration
+# 2. Configuration
 # NOTE: Ensure 'root:root' matches your MySQL credentials
 app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+mysqlconnector://root:root@localhost/ecommerce_db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['JWT_SECRET_KEY'] = 'super-secret-key'  # Change this in production!
 
-# 3. Initialize DB and Marshmallow
+# 3. Initialize Libraries
 db = SQLAlchemy(app)
 ma = Marshmallow(app)
+jwt = JWTManager(app)
 
 # --- MODELS ---
+
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password = db.Column(db.String(200), nullable=False)
 
 class OrderHeader(db.Model):
     __tablename__ = 'Order_Header'
@@ -24,7 +33,6 @@ class OrderHeader(db.Model):
     customer_id = db.Column(db.Integer, nullable=False)
     shipping_contact_mech_id = db.Column(db.Integer, nullable=False)
     billing_contact_mech_id = db.Column(db.Integer, nullable=False)
-    # Relationship to Items
     items = db.relationship('OrderItem', backref='order', cascade="all, delete-orphan", lazy=True)
 
 class OrderItem(db.Model):
@@ -52,16 +60,40 @@ order_schema = OrderHeaderSchema()
 orders_schema = OrderHeaderSchema(many=True)
 item_schema = OrderItemSchema()
 
-# --- API ENDPOINTS ---
+# --- AUTH ROUTES (New!) ---
 
-# HOME PAGE (Test Route)
-@app.route('/')
-def index():
-    return "Success! The API is running. Use Postman to send requests to /orders"
+@app.route('/register', methods=['POST'])
+def register():
+    data = request.json
+    # Hash the password for security
+    hashed_password = generate_password_hash(data['password'], method='pbkdf2:sha256')
+    new_user = User(username=data['username'], password=hashed_password)
+    
+    try:
+        db.session.add(new_user)
+        db.session.commit()
+        return jsonify({"message": "User registered successfully"}), 201
+    except:
+        return jsonify({"message": "Username already exists"}), 400
 
-# 1. Create an Order
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.json
+    user = User.query.filter_by(username=data['username']).first()
+    
+    # Check if user exists and password matches
+    if user and check_password_hash(user.password, data['password']):
+        access_token = create_access_token(identity=str(user.id))
+        return jsonify(access_token=access_token), 200
+    
+    return jsonify({"message": "Invalid credentials"}), 401
+
+# --- PROTECTED API ENDPOINTS ---
+
 @app.route('/orders', methods=['POST'])
+@jwt_required()  # <--- This protects the route
 def create_order():
+    current_user_id = get_jwt_identity() # You can use this to track who made the order
     data = request.json
     try:
         new_order = OrderHeader(
@@ -71,9 +103,8 @@ def create_order():
             billing_contact_mech_id=data['billing_contact_mech_id']
         )
         db.session.add(new_order)
-        db.session.flush() # Flush to generate order_id
-
-        # Process Items
+        db.session.flush()
+        
         items_data = data.get('order_items', [])
         for item in items_data:
             new_item = OrderItem(
@@ -90,40 +121,37 @@ def create_order():
         db.session.rollback()
         return jsonify({"error": str(e)}), 400
 
-# 2. Retrieve Order Details
 @app.route('/orders/<int:order_id>', methods=['GET'])
+@jwt_required()
 def get_order(order_id):
     order = OrderHeader.query.get_or_404(order_id)
     return order_schema.jsonify(order)
 
-# 3. Update an Order (Shipping/Billing info)
 @app.route('/orders/<int:order_id>', methods=['PUT'])
+@jwt_required()
 def update_order(order_id):
     order = OrderHeader.query.get_or_404(order_id)
     data = request.json
-    
     if 'shipping_contact_mech_id' in data:
         order.shipping_contact_mech_id = data['shipping_contact_mech_id']
     if 'billing_contact_mech_id' in data:
         order.billing_contact_mech_id = data['billing_contact_mech_id']
-        
     db.session.commit()
     return order_schema.jsonify(order)
 
-# 4. Delete an Order
 @app.route('/orders/<int:order_id>', methods=['DELETE'])
+@jwt_required()
 def delete_order(order_id):
     order = OrderHeader.query.get_or_404(order_id)
     db.session.delete(order)
     db.session.commit()
     return jsonify({"message": "Order deleted successfully"}), 200
 
-# 5. Add an Order Item
 @app.route('/orders/<int:order_id>/items', methods=['POST'])
+@jwt_required()
 def add_order_item(order_id):
-    order = OrderHeader.query.get_or_404(order_id) # Validate order exists
+    order = OrderHeader.query.get_or_404(order_id)
     data = request.json
-    
     new_item = OrderItem(
         order_id=order_id,
         product_id=data['product_id'],
@@ -134,22 +162,20 @@ def add_order_item(order_id):
     db.session.commit()
     return item_schema.jsonify(new_item), 201
 
-# 6. Update an Order Item
 @app.route('/orders/<int:order_id>/items/<int:item_seq_id>', methods=['PUT'])
+@jwt_required()
 def update_order_item(order_id, item_seq_id):
     item = OrderItem.query.filter_by(order_id=order_id, order_item_seq_id=item_seq_id).first_or_404()
     data = request.json
-    
     if 'quantity' in data:
         item.quantity = data['quantity']
     if 'status' in data:
         item.status = data['status']
-        
     db.session.commit()
     return item_schema.jsonify(item)
 
-# 7. Delete an Order Item
 @app.route('/orders/<int:order_id>/items/<int:item_seq_id>', methods=['DELETE'])
+@jwt_required()
 def delete_order_item(order_id, item_seq_id):
     item = OrderItem.query.filter_by(order_id=order_id, order_item_seq_id=item_seq_id).first_or_404()
     db.session.delete(item)
