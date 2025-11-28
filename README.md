@@ -10,4 +10,5 @@ RESTful API for an E-commerce system built with Python (Flask) and MySQL.
 ## Assignments
 - [x] Database Design & Scripts
 - [x] REST API Implementation
-- [x] Postman Testing       
+- [x] Postman Testing
+- [ ] JWT Authentication
